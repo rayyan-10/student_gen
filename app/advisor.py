@@ -4,11 +4,12 @@ import time
 import logging
 from groq import Groq, RateLimitError
 from app.config import get_settings
-from app.ml_service import (
-    get_high_risk_students,
-    get_student_analysis,
-    predict_all_students,
+from app.ml_service_dynamic import (
+    get_high_risk_records,
+    get_record_analysis,
+    predict_all_records,
 )
+from app.dataset_manager import get_dataset_manager
 from app.schemas import AdvisorResponse
 
 logger = logging.getLogger(__name__)
@@ -65,21 +66,22 @@ def _classify_query(query: str) -> str:
                                "who need", "struggling", "which students"]):
         return "intervention"
 
-    if any(kw in q for kw in ["why is", "risk of", "analyze student",
-                               "student s", "student "]):
-        # Check if a specific student ID is mentioned
-        if _extract_student_id(query) is not None:
+    if any(kw in q for kw in ["why is", "risk of", "analyze", "student s", 
+                               "student ", "record ", "id "]):
+        # Check if a specific record ID is mentioned
+        if _extract_record_id(query) is not None:
             return "student_risk"
 
     return "general"
 
 
-def _extract_student_id(query: str) -> int | None:
-    """Extract a student ID number from the query."""
-    # Match patterns like S101, s101, student 101, #101, id 101
+def _extract_record_id(query: str) -> int | None:
+    """Extract a record ID number from the query."""
+    # Match patterns like S101, s101, student 101, record 101, #101, id 101
     patterns = [
         r"[Ss](\d+)",
         r"student\s*#?\s*(\d+)",
+        r"record\s*#?\s*(\d+)",
         r"id\s*#?\s*(\d+)",
         r"#(\d+)",
     ]
@@ -92,27 +94,34 @@ def _extract_student_id(query: str) -> int | None:
 
 # ── Handlers ──────────────────────────────────────────────────────────
 
-def _handle_intervention() -> AdvisorResponse:
-    """List all HIGH risk students with their weak topics."""
-    high_risk = get_high_risk_students()
+def _handle_intervention(dataset_id: str) -> AdvisorResponse:
+    """List all HIGH risk records with their weak areas."""
+    try:
+        high_risk = get_high_risk_records(dataset_id)
+    except ValueError as e:
+        return AdvisorResponse(
+            response_type="intervention",
+            message=str(e),
+            data=None,
+        )
 
     if not high_risk:
         return AdvisorResponse(
             response_type="intervention",
-            message="No students are currently at HIGH risk. All students are performing adequately.",
+            message="No records are currently at HIGH risk. All records are performing adequately.",
             data=[],
         )
 
     summary_lines = []
     for s in high_risk:
-        weak = ", ".join(s["weak_topics"]) if s["weak_topics"] else "None below 50"
+        weak = ", ".join(s["weak_areas"]) if s["weak_areas"] else "None identified"
         summary_lines.append(
-            f"• Student {s['student_id']} — Pass Prob: {s['pass_probability']:.2%}, "
-            f"Weak Topics: {weak}"
+            f"• ID {s['id']} — Pass Prob: {s['pass_probability']:.2%}, "
+            f"Weak Areas: {weak}"
         )
 
     message = (
-        f"Found {len(high_risk)} HIGH-risk students who need immediate intervention:\n\n"
+        f"Found {len(high_risk)} HIGH-risk records that need immediate intervention:\n\n"
         + "\n".join(summary_lines)
     )
 
@@ -123,34 +132,38 @@ def _handle_intervention() -> AdvisorResponse:
     )
 
 
-def _handle_student_risk(student_id: int) -> AdvisorResponse:
-    """Explain why a specific student is at risk."""
-    analysis = get_student_analysis(student_id)
+def _handle_student_risk(dataset_id: str, record_id: int) -> AdvisorResponse:
+    """Explain why a specific record is at risk."""
+    try:
+        analysis = get_record_analysis(dataset_id, record_id)
+    except ValueError as e:
+        return AdvisorResponse(
+            response_type="student_risk",
+            message=str(e),
+            data=None,
+        )
 
     if analysis is None:
         return AdvisorResponse(
             response_type="student_risk",
-            message=f"Student with ID {student_id} was not found in the dataset.",
+            message=f"Record with ID {record_id} was not found in the dataset.",
             data=None,
         )
 
     # Build a structured JSON explanation via LLM
-    prompt = f"""You are an academic advisor AI. Analyze this student data and respond in ONLY valid JSON (no markdown, no extra text).
+    prompt = f"""You are an AI advisor. Analyze this record data and respond in ONLY valid JSON (no markdown, no extra text).
 
-Student Data:
-- Student ID: {analysis['student_id']}
-- Attendance: {analysis['attendance']}%
-- Internal Marks: {analysis['internal_marks']}/100
-- Assignment Marks: {analysis['assignment_marks']}/100
-- Previous GPA: {analysis['previous_gpa']}/10
-- Topic Scores: {json.dumps(analysis['topic_scores'])}
+Record Data:
+- ID: {analysis['id']}
+- Features: {json.dumps(analysis['features'])}
+- Topic/Area Scores: {json.dumps(analysis['topic_scores'])}
 - Pass Probability: {analysis['pass_probability']:.2%}
 - Risk Level: {analysis['risk_level']}
-- Weak Topics (below 50): {', '.join(analysis['weak_topics']) if analysis['weak_topics'] else 'None'}
+- Weak Areas (below 50): {', '.join(analysis['weak_areas']) if analysis['weak_areas'] else 'None'}
 
 Return ONLY this JSON structure:
 {{
-  "summary": "One-line summary of the student's situation",
+  "summary": "One-line summary of the record's situation",
   "risk_factors": [
     {{"factor": "Short title", "detail": "Brief explanation", "severity": "HIGH/MEDIUM/LOW"}}
   ],
@@ -171,7 +184,7 @@ Return ONLY this JSON structure:
     except json.JSONDecodeError:
         ai_analysis = {"summary": raw, "risk_factors": [], "recommendations": []}
 
-    # Merge student data + AI analysis into one structured response
+    # Merge record data + AI analysis into one structured response
     analysis["ai_analysis"] = ai_analysis
 
     return AdvisorResponse(
@@ -273,38 +286,149 @@ Return ONLY valid JSON, no extra text."""
     )
 
 
-def _handle_general(query: str) -> AdvisorResponse:
-    """Use Gemini to answer a free-form academic query with student context."""
-    all_students = predict_all_students()
-    high_risk = [s for s in all_students if s["risk_level"] == "HIGH"]
-    medium_risk = [s for s in all_students if s["risk_level"] == "MEDIUM"]
+def _handle_generate_quiz(dataset_id: str, record_id: int) -> AdvisorResponse:
+    """Generate a personalized quiz based on weak areas."""
+    try:
+        analysis = get_record_analysis(dataset_id, record_id)
+    except ValueError as e:
+        return AdvisorResponse(
+            response_type="generate_quiz",
+            message=str(e),
+            data=None,
+        )
+
+    if analysis is None:
+        return AdvisorResponse(
+            response_type="generate_quiz",
+            message=f"Record with ID {record_id} was not found in the dataset.",
+            data=None,
+        )
+
+    if analysis["risk_level"] != "HIGH":
+        return AdvisorResponse(
+            response_type="generate_quiz",
+            message=(
+                f"Record {record_id} is at {analysis['risk_level']} risk "
+                f"(pass probability: {analysis['pass_probability']:.2%}). "
+                "Quiz generation is designed for HIGH risk records. "
+                "This record does not require immediate intervention."
+            ),
+            data=analysis,
+        )
+
+    # Determine weakest areas
+    if not analysis["weak_areas"]:
+        return AdvisorResponse(
+            response_type="generate_quiz",
+            message=f"Record {record_id} has no identified weak areas below threshold.",
+            data=analysis,
+        )
+    
+    topic_scores = analysis["topic_scores"]
+    sorted_topics = sorted(topic_scores.items(), key=lambda x: x[1])
+    weakest_two = sorted_topics[:min(2, len(sorted_topics))]
+    weakest_names = [t[0] for t in weakest_two]
+
+    # Determine difficulty based on average feature scores
+    avg_score = sum(analysis["features"].values()) / len(analysis["features"])
+    if avg_score < 40:
+        difficulty = "Easy"
+    elif avg_score < 60:
+        difficulty = "Medium"
+    else:
+        difficulty = "Hard"
+
+    prompt = f"""You are an academic quiz generator.
+
+Generate a Predictive Learning Intervention quiz for a record struggling with: {', '.join(weakest_names)}.
+
+Context:
+- Average Score: {avg_score:.1f}
+- Required Difficulty: {difficulty}
+- Weakest area scores: {json.dumps(dict(weakest_two))}
+
+Generate EXACTLY the following in valid JSON (no markdown fences, pure JSON):
+{{
+  "mcqs": [
+    {{
+      "question": "...",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "correct_answer": "A/B/C/D",
+      "difficulty": "{difficulty}"
+    }},
+    // 3 MCQs total covering the weak areas
+  ],
+  "coding_problem": "A clear problem related to {weakest_names[0]} with input/output examples",
+  "conceptual_explanation": "A clear, concise explanation of the core concepts that should be reviewed"
+}}
+
+Make questions relevant, educational, and at {difficulty} difficulty.
+Return ONLY valid JSON, no extra text."""
+
+    raw_response = _call_llm(prompt)
+
+    # Parse the JSON response
+    try:
+        cleaned = raw_response.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        quiz_data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        quiz_data = {"raw_response": raw_response}
+
+    quiz_data["target_id"] = record_id
+    quiz_data["risk_level"] = analysis["risk_level"]
+    quiz_data["weakest_areas"] = weakest_names
+
+    return AdvisorResponse(
+        response_type="generate_quiz",
+        message=(
+            f"Generated {difficulty}-level quiz for Record {record_id} "
+            f"targeting weak areas: {', '.join(weakest_names)}."
+        ),
+        data=quiz_data,
+    )
+
+
+def _handle_general(dataset_id: str, query: str) -> AdvisorResponse:
+    """Use LLM to answer a free-form query with dataset context."""
+    try:
+        all_records = predict_all_records(dataset_id)
+    except ValueError as e:
+        return AdvisorResponse(
+            response_type="general",
+            message=str(e),
+            data=None,
+        )
+    
+    high_risk = [s for s in all_records if s["risk_level"] == "HIGH"]
+    medium_risk = [s for s in all_records if s["risk_level"] == "MEDIUM"]
 
     context_summary = (
-        f"Total students: {len(all_students)}\n"
+        f"Total records: {len(all_records)}\n"
         f"HIGH risk: {len(high_risk)}\n"
         f"MEDIUM risk: {len(medium_risk)}\n"
-        f"LOW risk: {len(all_students) - len(high_risk) - len(medium_risk)}\n"
+        f"LOW risk: {len(all_records) - len(high_risk) - len(medium_risk)}\n"
     )
 
     if high_risk:
         top_risk = sorted(high_risk, key=lambda x: x["pass_probability"])[:5]
-        context_summary += "\nTop 5 most at-risk students:\n"
+        context_summary += "\nTop 5 most at-risk records:\n"
         for s in top_risk:
             context_summary += (
-                f"  - Student {s['student_id']}: "
+                f"  - ID {s['id']}: "
                 f"Pass Prob {s['pass_probability']:.2%}, "
-                f"Weak: {', '.join(s['weak_topics'])}\n"
+                f"Weak: {', '.join(s['weak_areas'])}\n"
             )
 
-    prompt = f"""You are a GenAI Academic Advisor for a university's Student Result 
-Analysis & Pass Prediction System. You have access to the following class overview:
+    prompt = f"""You are a GenAI Advisor for a Predictive Analysis System. You have access to the following dataset overview:
 
 {context_summary}
 
 The user asks: "{query}"
 
 Provide a helpful, structured, and actionable response based on the data available. 
-If the query is about a specific student and you have data, reference it. 
 Keep your response concise and practical."""
 
     response_text = _call_llm(prompt)
@@ -312,7 +436,7 @@ Keep your response concise and practical."""
     return AdvisorResponse(
         response_type="general",
         message=response_text,
-        data={"total_students": len(all_students),
+        data={"total_records": len(all_records),
               "high_risk_count": len(high_risk),
               "medium_risk_count": len(medium_risk)},
     )
@@ -320,34 +444,34 @@ Keep your response concise and practical."""
 
 # ── Main Entry Point ──────────────────────────────────────────────────
 
-def handle_query(query: str) -> AdvisorResponse:
+def handle_query(query: str, dataset_id: str = "default") -> AdvisorResponse:
     """Route the user query to the appropriate handler."""
     intent = _classify_query(query)
 
     if intent == "intervention":
-        return _handle_intervention()
+        return _handle_intervention(dataset_id)
 
     elif intent == "student_risk":
-        student_id = _extract_student_id(query)
-        if student_id is None:
+        record_id = _extract_record_id(query)
+        if record_id is None:
             return AdvisorResponse(
                 response_type="student_risk",
-                message="Could not extract a student ID from your query. "
-                        "Please specify a student like 'S101' or 'student 101'.",
+                message="Could not extract a record ID from your query. "
+                        "Please specify an ID like 'S101', 'record 101', or 'id 101'.",
                 data=None,
             )
-        return _handle_student_risk(student_id)
+        return _handle_student_risk(dataset_id, record_id)
 
     elif intent == "generate_quiz":
-        student_id = _extract_student_id(query)
-        if student_id is None:
+        record_id = _extract_record_id(query)
+        if record_id is None:
             return AdvisorResponse(
                 response_type="generate_quiz",
-                message="Please specify which student to generate a quiz for. "
-                        "Example: 'Generate quiz for student S101'.",
+                message="Please specify which record to generate a quiz for. "
+                        "Example: 'Generate quiz for record 101'.",
                 data=None,
             )
-        return _handle_generate_quiz(student_id)
+        return _handle_generate_quiz(dataset_id, record_id)
 
     else:
-        return _handle_general(query)
+        return _handle_general(dataset_id, query)

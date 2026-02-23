@@ -7,9 +7,11 @@ class Settings(BaseSettings):
     """Application configuration loaded from .env file."""
 
     GROQ_API_KEY: str = ""
-    MODEL_PATH: str = "student_pass_model.pkl"
-    DATA_PATH: str = "students.csv"
-
+    
+    # Storage paths
+    UPLOAD_DIR: str = "uploads"
+    MODELS_DIR: str = "models"
+    
     # Risk thresholds
     HIGH_RISK_THRESHOLD: float = 0.4
     LOW_RISK_THRESHOLD: float = 0.65

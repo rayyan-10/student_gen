@@ -9,8 +9,10 @@ __pycache__/
 # Model artifacts
 *.pkl
 
-# Data files
-*.csv
+# Data files - keep example but ignore uploads
+students.csv
+uploads/
+models/
 
 # IDE
 .vscode/
@@ -22,3 +24,6 @@ __pycache__/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Temporary files
+temp_upload.csv

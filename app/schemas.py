@@ -5,6 +5,7 @@ from typing import Any, Optional
 class AdvisorRequest(BaseModel):
     """Request body for the /ask_advisor endpoint."""
     query: str
+    dataset_id: Optional[str] = "default"
 
 
 class MCQ(BaseModel):
